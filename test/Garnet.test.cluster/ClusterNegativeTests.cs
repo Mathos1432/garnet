@@ -8,9 +8,11 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
+using StackExchange.Redis;
 
 #if DEBUG
 using Garnet.common;
@@ -363,5 +365,86 @@ namespace Garnet.test.cluster
             }
         }
 #endif
+
+
+        [Test, CancelAfter(60_000)]
+        public async Task ClusterMultiFailoverTest(CancellationToken cancellationToken)
+        {
+            var nodes_count = 4;
+            context.CreateInstances(
+                nodes_count,
+                disableObjects: false,
+                enableAOF: true,
+                timeout: timeout,
+                OnDemandCheckpoint: true,
+                FastAofTruncate: true,
+                CommitFrequencyMs: -1,
+                useAofNullDevice: true);
+            context.CreateConnection();
+
+            context.clusterTestUtils.Meet(0, 1, logger: context.logger);
+            context.clusterTestUtils.Meet(0, 2, logger: context.logger);
+            context.clusterTestUtils.Meet(0, 3, logger: context.logger);
+
+            context.clusterTestUtils.WaitClusterNodesSync(0, 4, context.logger);
+
+            context.clusterTestUtils.AddSlotsRange(0, [(0, 8191)], logger: context.logger);
+            context.clusterTestUtils.AddSlotsRange(1, [(8192, 16383)], logger: context.logger);
+
+            context.clusterTestUtils.ClusterReplicate(2, 0, logger: context.logger);
+            context.clusterTestUtils.ClusterReplicate(3, 1, logger: context.logger);
+
+            context.clusterTestUtils.WaitClusterNodesSync(0, 4, context.logger);
+            context.clusterTestUtils.WaitClusterNodesSync(1, 4, context.logger);
+            context.clusterTestUtils.WaitClusterNodesSync(2, 4, context.logger);
+            context.clusterTestUtils.WaitClusterNodesSync(3, 4, context.logger);
+
+            Console.WriteLine("=====================");
+            Console.WriteLine("Current cluster status according to the different nodes: ");
+            Console.WriteLine("=====================");
+
+            PrintClusterNodesResult(context.clusterTestUtils.ClusterNodes(0));
+            PrintClusterNodesResult(context.clusterTestUtils.ClusterNodes(1));
+            PrintClusterNodesResult(context.clusterTestUtils.ClusterNodes(2));
+            PrintClusterNodesResult(context.clusterTestUtils.ClusterNodes(3));
+
+            Assert.That("OK" == context.clusterTestUtils.ClusterFailover(2));
+            Assert.That("OK" == context.clusterTestUtils.ClusterFailover(3));
+
+            Console.WriteLine("=====================");
+            Console.WriteLine("Cluster status after starting failover: ");
+            Console.WriteLine("=====================");
+
+
+            PrintClusterNodesResult(context.clusterTestUtils.ClusterNodes(0));
+            PrintClusterNodesResult(context.clusterTestUtils.ClusterNodes(1));
+            PrintClusterNodesResult(context.clusterTestUtils.ClusterNodes(2));
+            PrintClusterNodesResult(context.clusterTestUtils.ClusterNodes(3));
+            for (int i = 0; i < 10; i++)
+            {
+                await Task.Delay(500);
+                var cluster = context.clusterTestUtils.ClusterNodes(3);
+                var replicaWithHashSlots = cluster.Nodes.FirstOrDefault(x => x.IsReplica && x.Slots.Count > 0);
+                if (replicaWithHashSlots != null)
+                {
+                    Console.WriteLine("Bad replica: ");
+                    Console.WriteLine(replicaWithHashSlots.ToString());
+
+                    PrintClusterNodesResult(cluster);
+                    Assert.Fail("There should be no replica with assigned hashslots.");
+                }
+            }
+        }
+
+        private void PrintClusterNodesResult(ClusterConfiguration config)
+        {
+            Console.WriteLine("=====================");
+            foreach (var node in config.Nodes)
+            {
+                Console.WriteLine(node.ToString());
+            }
+            Console.WriteLine("=====================");
+        }
+
     }
 }
